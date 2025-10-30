@@ -16,6 +16,8 @@
 #include "MIC_MSM.h"
 #include "secrets.h"
 
+#include "Eyes.h"
+
 constexpr const char *IMAGE_URL = "https://raw.githubusercontent.com/Bodmer/TFT_eSPI/master/examples/320%20x%20240/BMPs/Autumn_240x320.bmp";
 constexpr const char *MP3_URL = "https://zvukogram.com/index.php?r=site/download&id=44225&type=mp3";
 constexpr const char *MP3_DEST_PATH = "/tutututu.mp3";
@@ -1237,6 +1239,14 @@ void setup() {
   Backlight_Init();
   LCD_Init();
   Lvgl_Init();
+
+    
+  // Центрируем глаза примерно по экрану (подгони координаты под свой дисплей)
+  Eyes_Create(lv_scr_act(), /*cx=*/160, /*cy=*/120, /*spacing=*/40, /*size=*/72);
+  // Можно сразу чуть “посмотреть” вправо-вверх:
+  Eyes_Look(0.15f, -0.1f);
+
+
   Audio_Init();
 
   lv_obj_clean(lv_scr_act());
@@ -1292,10 +1302,14 @@ void setup() {
     }
   }
   */
+
+
 }
 
 void loop() {
+ 
   Lvgl_Loop();
   handleVoiceAssistant();
   delay(5);
+  Eyes_Update();
 }
