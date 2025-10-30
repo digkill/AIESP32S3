@@ -654,7 +654,8 @@ void assistant_button_event_cb(lv_event_t *e) {
 }
 
 bool openAiConfigured() {
-  return std::strcmp(OPENAI_API_KEY, "YOUR_OPENAI_API_KEY") != 0 && std::strlen(OPENAI_API_KEY) > 0;
+  return std::strcmp(PROXY_HOST, "YOUR_PROXY_HOST") != 0 &&
+         std::strcmp(SERVICE_TOKEN, "REPLACE_WITH_SERVICE_TOKEN") != 0;
 }
 
 String escapeJson(const String &input) {
@@ -709,73 +710,141 @@ String decodeJsonString(const String &json, int startIndex) {
   return value;
 }
 
-String jsonExtractString(const String &json, const String &key) {
-  String pattern = String('"') + key + String('"');
-  int idx = json.indexOf(pattern);
-  while (idx >= 0) {
-    int colon = json.indexOf(':', idx + pattern.length());
-    if (colon < 0) {
-      return "";
-    }
-    int firstQuote = json.indexOf('"', colon);
-    if (firstQuote < 0) {
-      return "";
-    }
-    return decodeJsonString(json, firstQuote + 1);
+// Устойчивый поиск строкового значения по ключу: допускает пробелы после ':'
+String findJsonStringByKey(const String &json, const String &key, int startPos) {
+  String quotedKey = String('"') + key + String('"');
+  int k = json.indexOf(quotedKey, startPos);
+  if (k < 0) return "";
+
+  int colon = json.indexOf(':', k + quotedKey.length());
+  if (colon < 0) return "";
+
+  // пропускаем пробелы/табуляции/переводы строк
+  int i = colon + 1;
+  while (i < (int)json.length()) {
+    char c = json[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { i++; continue; }
+    break;
   }
-  return "";
+
+  // ожидаем строку в кавычках
+  if (i >= (int)json.length() || json[i] != '"') return "";
+  return decodeJsonString(json, i + 1);
+}
+
+String jsonExtractString(const String &json, const String &key) {
+  return findJsonStringByKey(json, key, 0);
 }
 
 String extractAssistantContent(const String &json) {
-  int rolePos = json.indexOf("\"role\":\"assistant\"");
-  if (rolePos < 0) {
-    return "";
-  }
-  int contentPos = json.indexOf("\"content\":\"", rolePos);
-  if (contentPos < 0) {
-    return "";
-  }
-  contentPos += String("\"content\":\"").length();
-  return decodeJsonString(json, contentPos);
-}
+  // 1) Находим блок(и), где role == "assistant"
+  int pos = 0;
+  while (true) {
+    int roleKey = json.indexOf("\"role\"", pos);
+    if (roleKey < 0) break;
 
+    String roleVal = findJsonStringByKey(json, "role", roleKey);
+    if (roleVal == "assistant") {
+      // Сначала пробуем обычный content как строку
+      String s = findJsonStringByKey(json, "content", roleKey);
+      if (!s.isEmpty()) return s;
+
+      // Некоторые ответы отдают content как массив объектов {type:"text", text:"..."}
+      s = findJsonStringByKey(json, "text", roleKey);
+      if (!s.isEmpty()) return s;
+    }
+
+    pos = roleKey + 6; // сдвигаем поиск дальше
+  }
+
+  // 2) Фоллбек: choices[].message.*
+  int choicesPos = json.indexOf("\"choices\"");
+  if (choicesPos >= 0) {
+    int msgPos = json.indexOf("\"message\"", choicesPos);
+    if (msgPos >= 0) {
+      String s = findJsonStringByKey(json, "content", msgPos);
+      if (!s.isEmpty()) return s;
+
+      s = findJsonStringByKey(json, "text", msgPos);
+      if (!s.isEmpty()) return s;
+    }
+  }
+
+  // 3) Глобальные фоллбеки
+  {
+    String s = findJsonStringByKey(json, "content", 0);
+    if (!s.isEmpty()) return s;
+  }
+  {
+    String s = findJsonStringByKey(json, "text", 0);
+    if (!s.isEmpty()) return s;
+  }
+
+  return "";
+}
+ 
+
+// ---------- УСТОЙЧИВЫЙ ПАРСЕР HTTP-ОТВЕТА + таймаут ожидания ----------
 bool readHttpResponse(WiFiClient &client, int &statusCode, String &contentType, String &body, File *destFile) {
   statusCode = -1;
   contentType = "";
   body = "";
 
-  String statusLine = client.readStringUntil('\n');
-  if (statusLine.length() == 0) {
-    return false;
+  // Ждём появления данных (или закрытия) с таймаутом
+  unsigned long t0 = millis();
+  while (!client.available()) {
+    if (!client.connected() && !client.available()) {
+      return false; // сервер закрыл соединение до ответа
+    }
+    if (millis() - t0 > 15000) { // 15s
+      return false; // таймаут ожидания ответа
+    }
+    delay(5);
   }
-  statusLine.trim();
+
+  // Читаем первую непустую строку как статус-строку (иногда бывают пустые строки/CRLF)
+  String statusLine;
+  for (;;) {
+    statusLine = client.readStringUntil('\n');
+    if (statusLine.length() == 0) {
+      if (!client.connected() && !client.available()) return false;
+      continue;
+    }
+    statusLine.trim(); // убираем \r и пробелы
+    if (statusLine.length() == 0) continue;
+    // ожидаем "HTTP/1.x ..."
+    if (!statusLine.startsWith("HTTP/1.")) {
+      // иногда могут прилететь странные строки — попробуем читать дальше
+      if (!client.connected() && !client.available()) return false;
+      continue;
+    }
+    break;
+  }
+
   int firstSpace = statusLine.indexOf(' ');
-  if (firstSpace < 0) {
-    return false;
-  }
+  if (firstSpace < 0) return false;
   int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
-  if (secondSpace < 0) {
-    secondSpace = statusLine.length();
-  }
+  if (secondSpace < 0) secondSpace = statusLine.length();
   statusCode = statusLine.substring(firstSpace + 1, secondSpace).toInt();
 
   int contentLength = -1;
   bool chunked = false;
 
+  // Заголовки
   while (client.connected()) {
     String headerLine = client.readStringUntil('\n');
-    if (headerLine == "\r" || headerLine.length() == 0) {
-      break;
-    }
+    if (headerLine.length() == 0) break;
     headerLine.trim();
+    if (headerLine.length() == 0) break; // пустая строка => конец заголовков
+
     int colon = headerLine.indexOf(':');
-    if (colon <= 0) {
-      continue;
-    }
+    if (colon <= 0) continue;
+
     String headerName = headerLine.substring(0, colon);
     headerName.toLowerCase();
     String headerValue = headerLine.substring(colon + 1);
     headerValue.trim();
+
     if (headerName == "content-length") {
       contentLength = headerValue.toInt();
     } else if (headerName == "transfer-encoding" && headerValue.equalsIgnoreCase("chunked")) {
@@ -787,62 +856,48 @@ bool readHttpResponse(WiFiClient &client, int &statusCode, String &contentType, 
 
   uint8_t buffer[1024];
   auto appendData = [&](const uint8_t *data, size_t len) {
-    if (destFile) {
-      destFile->write(data, len);
-    } else {
-      for (size_t i = 0; i < len; ++i) {
-        body += static_cast<char>(data[i]);
-      }
-    }
+    if (destFile) destFile->write(data, len);
+    else body.concat(String((const char*)data, len));
   };
 
+  // Тело
   if (chunked) {
-    while (true) {
+    for (;;) {
       String line = client.readStringUntil('\n');
       line.trim();
-      if (line.length() == 0) {
-        continue;
-      }
+      if (line.length() == 0) continue;
       uint32_t chunkSize = strtoul(line.c_str(), nullptr, 16);
       if (chunkSize == 0) {
+        // финальные заголовки после нулевого чанка (обычно пусто)
         client.readStringUntil('\n');
         break;
       }
       uint32_t remaining = chunkSize;
       while (remaining > 0) {
         size_t toRead = remaining > sizeof(buffer) ? sizeof(buffer) : remaining;
-        int readBytes = client.read(buffer, toRead);
-        if (readBytes <= 0) {
-          return false;
-        }
-        appendData(buffer, static_cast<size_t>(readBytes));
-        remaining -= static_cast<uint32_t>(readBytes);
-        pumpLvgl(0);
+        int n = client.read(buffer, toRead);
+        if (n <= 0) return false;
+        appendData(buffer, (size_t)n);
+        remaining -= (uint32_t)n;
       }
-      client.read();
-      client.read();
+      // CRLF после чанка
+      client.read(); client.read();
     }
   } else if (contentLength >= 0) {
     int remaining = contentLength;
     while (remaining > 0) {
-      size_t toRead = remaining > static_cast<int>(sizeof(buffer)) ? sizeof(buffer) : remaining;
-      int readBytes = client.read(buffer, toRead);
-      if (readBytes <= 0) {
-        return false;
-      }
-      appendData(buffer, static_cast<size_t>(readBytes));
-      remaining -= readBytes;
-      pumpLvgl(0);
+      size_t toRead = remaining > (int)sizeof(buffer) ? sizeof(buffer) : remaining;
+      int n = client.read(buffer, toRead);
+      if (n <= 0) return false;
+      appendData(buffer, (size_t)n);
+      remaining -= n;
     }
   } else {
+    // Без Content-Length — читаем до закрытия
     while (client.connected() || client.available()) {
-      int readBytes = client.read(buffer, sizeof(buffer));
-      if (readBytes > 0) {
-        appendData(buffer, static_cast<size_t>(readBytes));
-        pumpLvgl(0);
-      } else {
-        pumpLvgl(0);
-      }
+      int n = client.read(buffer, sizeof(buffer));
+      if (n > 0) appendData(buffer, (size_t)n);
+      else delay(1);
     }
   }
 
@@ -870,8 +925,10 @@ bool transcribeRecording(String &outText) {
 
   WiFiClientSecure client;
   client.setInsecure();
-  if (!client.connect("api.openai.com", 443)) {
-    setStatus("Нет подключения к OpenAI");
+  client.setHandshakeTimeout(15000);
+  client.setTimeout(15000);
+  if (!client.connect(PROXY_HOST, 443)) {
+    setStatus("Нет подключения к прокси (transcribe)");
     file.close();
     return false;
   }
@@ -891,17 +948,11 @@ bool transcribeRecording(String &outText) {
   size_t contentLength = partModel.length() + partFormat.length() + partFileHeader.length() + fileSize + closing.length();
 
   client.print("POST /v1/audio/transcriptions HTTP/1.1\r\n");
-  client.print("Host: api.openai.com\r\n");
-  client.print("Authorization: Bearer ");
-  client.print(OPENAI_API_KEY);
-  client.print("\r\n");
-  client.print("Content-Type: multipart/form-data; boundary=");
-  client.print(boundary);
-  client.print("\r\n");
+  client.print("Host: "); client.print(PROXY_HOST); client.print("\r\n");
+  client.print("Authorization: Bearer "); client.print(SERVICE_TOKEN); client.print("\r\n");
+  client.print("Content-Type: multipart/form-data; boundary="); client.print(boundary); client.print("\r\n");
   client.print("Connection: close\r\n");
-  client.print("Content-Length: ");
-  client.print(static_cast<unsigned long>(contentLength));
-  client.print("\r\n\r\n");
+  client.print("Content-Length: "); client.print((unsigned long)contentLength); client.print("\r\n\r\n");
 
   client.print(partModel);
   client.print(partFormat);
@@ -936,7 +987,8 @@ bool transcribeRecording(String &outText) {
   }
 
   if (statusCode != 200) {
-    Serial.println(body);
+    Serial.printf("[transcribe] HTTP %d\n", statusCode);
+    Serial.println(body.substring(0, 512));
     setStatus(String("Ошибка транскрипции (HTTP ") + statusCode + ")");
     return false;
   }
@@ -960,11 +1012,15 @@ bool requestAssistantReply(const String &userText, String &assistantReply) {
 
   WiFiClientSecure client;
   client.setInsecure();
-  if (!client.connect("api.openai.com", 443)) {
-    setStatus("Нет подключения к OpenAI (chat)");
+  client.setHandshakeTimeout(15000);
+  client.setTimeout(15000);
+
+  if (!client.connect(PROXY_HOST, 443)) {
+    setStatus("Нет подключения к прокси (chat)");
     return false;
   }
 
+  // Формируем JSON-пэйлоад
   String payload = "{";
   payload += "\"model\":\"gpt-4o-mini\",";
   payload += "\"temperature\":0.7,";
@@ -973,16 +1029,16 @@ bool requestAssistantReply(const String &userText, String &assistantReply) {
   payload += "{\"role\":\"user\",\"content\":\"" + escapeJson(userText) + "\"}";
   payload += "]}";
 
+  // HTTP/1.1 запрос
   client.print("POST /v1/chat/completions HTTP/1.1\r\n");
-  client.print("Host: api.openai.com\r\n");
-  client.print("Authorization: Bearer ");
-  client.print(OPENAI_API_KEY);
-  client.print("\r\n");
+  client.print("Host: "); client.print(PROXY_HOST); client.print("\r\n");
+  client.print("Authorization: Bearer "); client.print(SERVICE_TOKEN); client.print("\r\n");
   client.print("Content-Type: application/json\r\n");
+  client.print("Accept: application/json\r\n");
+  client.print("Accept-Encoding: identity\r\n"); // просим не gzip'ить
+  client.print("Expect: \r\n");                   // отключаем 100-continue
   client.print("Connection: close\r\n");
-  client.print("Content-Length: ");
-  client.print(payload.length());
-  client.print("\r\n\r\n");
+  client.print("Content-Length: "); client.print((unsigned long)payload.length()); client.print("\r\n\r\n");
   client.print(payload);
 
   int statusCode;
@@ -990,25 +1046,54 @@ bool requestAssistantReply(const String &userText, String &assistantReply) {
   String body;
   bool ok = readHttpResponse(client, statusCode, contentType, body, nullptr);
   client.stop();
+
   if (!ok) {
     setStatus("Не удалось получить ответ чат-модели");
     return false;
   }
 
   if (statusCode != 200) {
-    Serial.println(body);
+    // покажем первые ~1 КБ ответа в сериал для диагностики
+    Serial.println("[chat] Non-200 response:");
+    Serial.println(body.substring(0, 1024));
     setStatus(String("Ошибка ChatCompletions (HTTP ") + statusCode + ")");
     return false;
   }
 
+  // Пытаемся достать текст максимально устойчиво
   assistantReply = extractAssistantContent(body);
   assistantReply.trim();
+
   if (assistantReply.isEmpty()) {
+    // дополнительный фоллбэк: иногда content=null, а массив content[].text присутствует
+    int choicesPos = body.indexOf("\"choices\"");
+    if (choicesPos >= 0) {
+      int msgPos  = body.indexOf("\"message\"", choicesPos);
+      if (msgPos >= 0) {
+        int textPos = body.indexOf("\"text\":\"", msgPos);
+        if (textPos >= 0) {
+          // простое извлечение после "text":
+          int q = body.indexOf('"', body.indexOf(':', textPos));
+          if (q >= 0) {
+            String s = decodeJsonString(body, q + 1);
+            s.trim();
+            if (!s.isEmpty()) assistantReply = s;
+          }
+        }
+      }
+    }
+  }
+
+  if (assistantReply.isEmpty()) {
+    Serial.println("[chat] Failed to extract assistant content. Body preview:");
+    Serial.println(body.substring(0, 1024));
     setStatus("Не удалось извлечь ответ ассистента");
     return false;
   }
+
   return true;
 }
+
 
 bool synthesizeSpeech(const String &text, const char *destPath) {
   if (!openAiConfigured()) {
@@ -1027,8 +1112,10 @@ bool synthesizeSpeech(const String &text, const char *destPath) {
 
   WiFiClientSecure client;
   client.setInsecure();
-  if (!client.connect("api.openai.com", 443)) {
-    setStatus("Нет подключения к OpenAI (speech)");
+  client.setHandshakeTimeout(15000);
+  client.setTimeout(15000);
+  if (!client.connect(PROXY_HOST, 443)) {
+    setStatus("Нет подключения к прокси (speech)");
     outFile.close();
     return false;
   }
@@ -1040,16 +1127,12 @@ bool synthesizeSpeech(const String &text, const char *destPath) {
   payload += "\"input\":\"" + escapeJson(text) + "\"}";
 
   client.print("POST /v1/audio/speech HTTP/1.1\r\n");
-  client.print("Host: api.openai.com\r\n");
-  client.print("Authorization: Bearer ");
-  client.print(OPENAI_API_KEY);
-  client.print("\r\n");
+  client.print("Host: "); client.print(PROXY_HOST); client.print("\r\n");
+  client.print("Authorization: Bearer "); client.print(SERVICE_TOKEN); client.print("\r\n");
   client.print("Content-Type: application/json\r\n");
   client.print("Accept: audio/mpeg\r\n");
   client.print("Connection: close\r\n");
-  client.print("Content-Length: ");
-  client.print(payload.length());
-  client.print("\r\n\r\n");
+  client.print("Content-Length: "); client.print(payload.length()); client.print("\r\n\r\n");
   client.print(payload);
 
   int statusCode;
@@ -1181,6 +1264,7 @@ void setup() {
     return;
   }
 
+/*
   setStatus("Загружается изображение...");
   bool downloaded = downloadImage(IMAGE_URL);
   bool decoded = downloaded ? convertBmpToLvglImage(image_data) : false;
@@ -1207,6 +1291,7 @@ void setup() {
       audio_playback_started = playAudioFromSd(MP3_DEST_PATH, MP3_FILE_NAME);
     }
   }
+  */
 }
 
 void loop() {
